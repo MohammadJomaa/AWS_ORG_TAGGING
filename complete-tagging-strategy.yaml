@@ -1,0 +1,908 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Complete Automated AWS Resource Tagging Strategy - Management Account + StackSet Deployment'
+
+Parameters:
+  ManagementAccountId:
+    Type: String
+    Description: 12-digit AWS Account ID of the management (payer) account
+    AllowedPattern: '^\d{12}$'
+    MinLength: 12
+    MaxLength: 12
+  
+  OrganizationId:
+    Type: String
+    Description: AWS Organization ID (e.g., o-xxxxxxxxxx)
+    Default: ''
+  
+  ConfigRegion:
+    Type: String
+    Description: AWS Region for Config and Lambda functions
+    Default: 'me-central-1'
+    AllowedValues:
+      - 'us-east-1'
+      - 'us-west-2'
+      - 'eu-west-1'
+      - 'ap-southeast-1'
+      - 'me-central-1'
+  
+  EnforceValues:
+    Type: String
+    Description: Whether to enforce tag values (true) or just keys (false)
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  
+  TaggerFunctionName:
+    Type: String
+    Description: Name for the tagger Lambda function
+    Default: 'OrgAccountTagger'
+  
+  EvaluatorFunctionName:
+    Type: String
+    Description: Name for the evaluator Lambda function
+    Default: 'ConfigOrgAccountTagEvaluator'
+  
+  MemberRoleName:
+    Type: String
+    Description: Name of the cross-account role in member accounts
+    Default: 'TagPropagatorRole'
+  
+  DeploymentRegions:
+    Type: CommaDelimitedList
+    Description: AWS regions where the StackSet should be deployed
+    Default: 'me-central-1'
+  
+  FailureTolerancePercentage:
+    Type: Number
+    Description: Percentage of accounts in which a stack operation can fail before the operation is stopped
+    Default: 0
+    MinValue: 0
+    MaxValue: 100
+  
+  MaxConcurrentPercentage:
+    Type: Number
+    Description: Maximum percentage of accounts in which a stack operation can be performed at the same time
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+  
+
+Conditions:
+  HasOrganizationId: !Not [!Equals [!Ref OrganizationId, '']]
+
+Resources:
+  # ==================== MANAGEMENT ACCOUNT COMPONENTS ====================
+  
+  # Lambda Execution Role for Management Account (LambdaTagPropagatorRole)
+  LambdaTagPropagatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaTagPropagatorRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OrganizationsAndLambdaPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:ListRoots
+                  - organizations:ListChildren
+                  - organizations:ListParents
+                  - organizations:ListAccounts
+                  - organizations:ListAccountsForParent
+                  - organizations:ListTagsForResource
+                  - organizations:TagResource
+                  - organizations:UntagResource
+                Resource: '*'
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub 'arn:aws:iam::*:role/${MemberRoleName}'
+              - Effect: Allow
+                Action:
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:DescribeRule
+                  - events:ListTargetsByRule
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:*:*:function:${TaggerFunctionName}'
+              - Effect: Allow
+                Action:
+                  - config:PutEvaluations
+                Resource: '*'
+
+  # Lambda Function: OrgAccountTagger
+  OrgAccountTaggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref TaggerFunctionName
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaTagPropagatorRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          ROLE_NAME: !Ref MemberRoleName
+          ENFORCE_VALUES: !Ref EnforceValues
+      Code:
+        ZipFile: |
+          """
+          OrgAccountTagger (hardened)
+          ---------------------------
+          Purpose:
+            - Add any missing tag KEYS from the *owning account's* AWS Organizations tags
+              to a single resource in a member account.
+
+          Environment:
+            - ROLE_NAME        (default: TagPropagatorRole)  # cross-account role in members
+            - ENFORCE_VALUES   ("true"/"false", default: false)
+
+          Required IAM on member role (TagPropagatorRole):
+            - tag:TagResources, tag:UntagResources, tag:GetResources
+            - s3:GetBucketTagging, s3:PutBucketTagging
+            - route53resolver:TagResource
+          """
+
+          import json
+          import os
+          import logging
+          from typing import Dict, Optional
+
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Management account clients
+          org = boto3.client("organizations")
+          sts = boto3.client("sts")
+
+          # ---- Config knobs ----
+          ROLE_NAME = os.environ.get("ROLE_NAME", "TagPropagatorRole")
+          BACKOFF = Config(retries={"max_attempts": 8, "mode": "standard"})
+          ENFORCE_VALUES = os.environ.get("ENFORCE_VALUES", "false").lower() == "true"
+
+          # Resource types we will never try to tag (service-managed / not taggable)
+          NON_TAGGABLE_TYPES = {
+              "AWS::Config::ConfigurationRecorder",
+              "AWS::Route53Resolver::ResolverRuleAssociation",  # association objects aren't taggable
+          }
+
+          def _assume(account_id: str) -> boto3.Session:
+              arn = f"arn:aws:iam::{account_id}:role/{ROLE_NAME}"
+              creds = sts.assume_role(RoleArn=arn, RoleSessionName="acct-tag-baseline")["Credentials"]
+              return boto3.Session(
+                  aws_access_key_id=creds["AccessKeyId"],
+                  aws_secret_access_key=creds["SecretAccessKey"],
+                  aws_session_token=creds["SessionToken"],
+              )
+
+          def _account_tags(account_id: str) -> Dict[str, str]:
+              resp = org.list_tags_for_resource(ResourceId=account_id)
+              return {t["Key"]: t["Value"] for t in resp.get("Tags", [])}
+
+          # ---------- Service helpers ----------
+
+          def _tag_generic(sess: boto3.Session, region: str, resource_arn: str, tags: Dict[str, str]) -> None:
+              tagging = sess.client("resourcegroupstaggingapi", region_name=region, config=BACKOFF)
+              tagging.tag_resources(ResourceARNList=[resource_arn], Tags=tags)
+
+          def _s3_bucket_from_arn(arn: Optional[str]) -> Optional[str]:
+              if not arn:
+                  return None
+              if arn.startswith("arn:aws:s3:::"):
+                  return arn.split(":::")[-1]
+              return None
+
+          def _tag_s3_bucket(sess: boto3.Session, bucket_name: str, tags: Dict[str, str]) -> None:
+              s3 = sess.client("s3", config=BACKOFF)
+              current: Dict[str, str] = {}
+              try:
+                  resp = s3.get_bucket_tagging(Bucket=bucket_name)
+                  current = {t["Key"]: t["Value"] for t in resp.get("TagSet", [])}
+              except ClientError as e:
+                  # S3 returns ClientError with code 'NoSuchTagSet' when bucket has no tags
+                  if e.response.get("Error", {}).get("Code") not in ("NoSuchTagSet", "NoSuchTagSetError", "NoSuchTagSetException"):
+                      raise
+
+              merged = dict(current)
+              for k, v in tags.items():
+                  if ENFORCE_VALUES or k not in merged:
+                      merged[k] = v
+
+              s3.put_bucket_tagging(
+                  Bucket=bucket_name,
+                  Tagging={"TagSet": [{"Key": k, "Value": v} for k, v in merged.items()]}
+              )
+
+          def _is_invalid_or_system_arn(rtype: str, arn: Optional[str]) -> bool:
+              # No ARN? invalid
+              if not arn or not arn.startswith("arn:"):
+                  return True
+              # ARNs with missing account like '...:region::...' (double colon) are often service-managed -> skip
+              if "::" in arn.split(":")[5]:  # naive check on the resource part
+                  return True
+              # Route53 Resolver autodefined rules (internet-resolver) are system-managed and not taggable
+              if rtype.startswith("AWS::Route53Resolver::") and "autodefined" in arn:
+                  return True
+              return False
+
+          def _tag_route53resolver(sess: boto3.Session, region: str, arn: str, tags: Dict[str, str]) -> None:
+              """
+              Use service API for resolver resources. Works for customer-managed resolver rules/endpoints.
+              Autodefined/system rules will be filtered earlier.
+              """
+              r53r = sess.client("route53resolver", region_name=region, config=BACKOFF)
+              r53r.tag_resource(ResourceArn=arn, Tags=[{"Key": k, "Value": v} for k, v in tags.items()])
+
+          # Map of resourceType prefix to a dedicated tagger (when we shouldn't use generic)
+          SERVICE_TAGGERS = {
+              "AWS::S3::Bucket": "s3",
+              "AWS::Route53Resolver::": "r53r",  # any resolver* type handled by service API if valid ARN
+          }
+
+          # ---------- Main ----------
+
+          def lambda_handler(event, _):
+              logger.info(f"[tagger] {json.dumps(event)[:1500]}")
+              account_id   = event["accountId"]
+              region       = event.get("region") or "us-east-1"
+              rtype        = event.get("resourceType") or ""
+              arn          = event.get("resourceArn")  # may be None for some CI types
+              rid          = event.get("resourceId")   # bucket name etc.
+              resource_tags = event.get("resourceTags") or {}
+
+              # 1) If the resource type is not taggable, bail early
+              if rtype in NON_TAGGABLE_TYPES:
+                  logger.info(f"[tagger] skipping non-taggable type: {rtype}")
+                  return {"status": "skipped", "reason": "non-taggable-type"}
+
+              # 2) Pull baseline org tags
+              baseline = _account_tags(account_id)
+              if not baseline:
+                  logger.info("[tagger] account has no org tags; nothing to do")
+                  return {"status": "ok", "changed": 0}
+
+              # 3) Decide what to apply
+              if ENFORCE_VALUES:
+                  to_apply = {k: v for k, v in baseline.items() if resource_tags.get(k) != v}
+              else:
+                  to_apply = {k: v for k, v in baseline.items() if k not in resource_tags}
+
+              if not to_apply:
+                  return {"status": "ok", "changed": 0}
+
+              # 4) Build/validate ARN or special-case S3 when ARN missing
+              # Construct S3 ARN if needed
+              if rtype == "AWS::S3::Bucket" and (not arn or not arn.startswith("arn:aws:s3:::")) and rid:
+                  arn = f"arn:aws:s3:::{rid}"
+
+              if _is_invalid_or_system_arn(rtype, arn):
+                  logger.info(f"[tagger] skipping invalid/system-managed ARN for {rtype}: {arn}")
+                  return {"status": "skipped", "reason": "invalid-or-system-arn"}
+
+              # 5) Assume into member and apply tags
+              sess = _assume(account_id)
+              try:
+                  # S3 bucket: use S3 API
+                  if rtype == "AWS::S3::Bucket":
+                      bucket = _s3_bucket_from_arn(arn)
+                      if not bucket:
+                          logger.info(f"[tagger] bad S3 ARN, skipping: {arn}")
+                          return {"status": "skipped", "reason": "bad-s3-arn"}
+                      _tag_s3_bucket(sess, bucket, to_apply)
+
+                  # Route53Resolver: use service API for valid customer-managed ARNs
+                  elif rtype.startswith("AWS::Route53Resolver::"):
+                      _tag_route53resolver(sess, region, arn, to_apply)
+
+                  # Generic: try Resource Groups Tagging API
+                  else:
+                      _tag_generic(sess, region, arn, to_apply)
+
+              except ClientError as e:
+                  logger.error(f"[tagger] failed: {e}")
+                  raise
+
+              logger.info(f"[tagger] applied {len(to_apply)} tag(s)")
+              return {"status": "ok", "changed": len(to_apply)}
+
+  # Lambda Function: ConfigOrgAccountTagEvaluator
+  ConfigOrgAccountTagEvaluatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref EvaluatorFunctionName
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaTagPropagatorRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          TAGGER_FUNCTION_NAME: !Ref TaggerFunctionName
+          ENFORCE_VALUES: !Ref EnforceValues
+          MEMBER_EVAL_ROLE: !Ref MemberRoleName
+      Code:
+        ZipFile: |
+          """
+          ConfigOrgAccountTagEvaluator (Organization Config Rule)
+          ------------------------------------------------------
+          Purpose:
+            - For each AWS Config Configuration Item (CI), mark COMPLIANT if the resource
+              includes all tag KEYS from the *owning account's* AWS Organizations tags.
+            - If keys are missing (or values differ when ENFORCE_VALUES=true),
+              mark NON_COMPLIANT and asynchronously invoke a Tagger to remediate.
+
+          Environment variables:
+            - TAGGER_FUNCTION_NAME  (default: OrgAccountTagger)
+            - ENFORCE_VALUES        ("true"/"false", default: false)
+            - MEMBER_EVAL_ROLE      (default: OrgConfigRuleExecutionRole)
+            - AWS_REGION            (implicitly set by Lambda; also used as default rule region)
+
+          IAM (Lambda execution role in the Management/Delegated Admin account):
+            - organizations:ListTagsForResource
+            - lambda:InvokeFunction        (to call tagger)
+            - sts:AssumeRole               (to arn:aws:iam::*:role/<MEMBER_EVAL_ROLE>)
+            - logs:CreateLogGroup/Stream, logs:PutLogEvents (AWSLambdaBasicExecutionRole)
+
+          Member account role (deployed to ALL accounts, incl. management if you want):
+            - Name: OrgConfigRuleExecutionRole  (or set MEMBER_EVAL_ROLE accordingly)
+            - Trusts your Lambda execution role (and optionally Condition on your Org ID)
+            - Policy: { "Action": "config:PutEvaluations", "Resource": "*", "Effect": "Allow" }
+          """
+
+          import json
+          import os
+          import logging
+          from typing import Dict, Any
+          from datetime import datetime, timezone
+          from functools import lru_cache
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # --------- Static / Env config ----------
+          CONFIG_REGION     = "me-central-1"  # Will be overridden by Lambda context
+          TAGGER_FN         = os.environ.get("TAGGER_FUNCTION_NAME", "OrgAccountTagger")
+          ENFORCE_VALUES    = os.environ.get("ENFORCE_VALUES", "false").lower() == "true"
+          MEMBER_EVAL_ROLE  = os.environ.get("MEMBER_EVAL_ROLE", "TagPropagatorRole")
+
+          # --------- Base clients (management account) ----------
+          org = boto3.client("organizations")                       # Organizations is global
+          lambda_client = boto3.client("lambda", region_name=CONFIG_REGION)
+          sts = boto3.client("sts")
+
+          # Determine the account this Lambda is running in (management/delegated admin)
+          try:
+              _caller_identity = sts.get_caller_identity()
+              MY_ACCOUNT_ID = _caller_identity["Account"]
+          except Exception:
+              # Should not happen in Lambda, but keep a safe default
+              MY_ACCOUNT_ID = None
+
+
+          # ===================== Helpers =====================
+
+          def _account_tags(account_id: str) -> Dict[str, str]:
+              """Return the account's AWS Organizations tags as {key: value}."""
+              if not account_id:
+                  return {}
+              resp = org.list_tags_for_resource(ResourceId=account_id)
+              return {t["Key"]: t["Value"] for t in resp.get("Tags", [])}
+
+
+          def _extract_res_tags(ci: Dict[str, Any]) -> Dict[str, str]:
+              """
+              Extract resource tags from a Config Configuration Item (varies by type):
+                - ci["tags"] / ci["Tags"]
+                - ci["configuration"]["tags"/"Tags"] (stringified JSON or dict)
+                - list-of-dicts [{"Key"/"key","Value"/"value"}]
+              """
+              tags = ci.get("tags") or ci.get("Tags") or {}
+              if not tags:
+                  cfg = ci.get("configuration")
+                  if isinstance(cfg, str):
+                      try:
+                          cfg = json.loads(cfg)
+                      except Exception:
+                          cfg = None
+                  if isinstance(cfg, dict):
+                      tags = cfg.get("tags") or cfg.get("Tags") or {}
+
+              if isinstance(tags, list):
+                  out = {}
+                  for t in tags:
+                      k = t.get("Key") or t.get("key")
+                      v = t.get("Value") or t.get("value")
+                      if k is not None:
+                          out[k] = v
+                  return out
+
+              return tags if isinstance(tags, dict) else {}
+
+
+          def _ordering_ts(ci: Dict[str, Any]) -> datetime:
+              """AWS Config requires a datetime for OrderingTimestamp (CI capture time)."""
+              ts = ci.get("configurationItemCaptureTime")
+              if isinstance(ts, datetime):
+                  return ts
+              if isinstance(ts, str):
+                  for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+                      try:
+                          return datetime.strptime(ts, fmt).replace(tzinfo=timezone.utc)
+                      except ValueError:
+                          pass
+              return datetime.now(timezone.utc)
+
+
+          @lru_cache(maxsize=512)
+          def _assume_member_role(account_id: str) -> Dict[str, str]:
+              """Assume the member account role for PutEvaluations; cache creds per account."""
+              resp = sts.assume_role(
+                  RoleArn=f"arn:aws:iam::{account_id}:role/{MEMBER_EVAL_ROLE}",
+                  RoleSessionName="OrgConfigPutEval"
+              )
+              return resp["Credentials"]
+
+
+          def _member_config_client(account_id: str, region: str):
+              """
+              Return a boto3 Config client that can call PutEvaluations in the
+              SAME account/region as the per-account service rule that invoked us.
+              """
+              # If the invoking account IS this Lambda's account and you also deploy a
+              # per-account service rule here, native creds work. Otherwise assume role.
+              if MY_ACCOUNT_ID and account_id == MY_ACCOUNT_ID:
+                  return boto3.client("config", region_name=region)
+
+              # Cross-account: assume the member role
+              creds = _assume_member_role(account_id)
+              return boto3.client(
+                  "config",
+                  region_name=region,
+                  aws_access_key_id=creds["AccessKeyId"],
+                  aws_secret_access_key=creds["SecretAccessKey"],
+                  aws_session_token=creds["SessionToken"],
+              )
+
+
+          def _put_eval(result_token: str, ci: Dict[str, Any], compliant: bool, note: str,
+                        account_id: str, region: str) -> None:
+              """Report compliance back to AWS Config in the member account/region."""
+              cfg = _member_config_client(account_id, region)
+              try:
+                  cfg.put_evaluations(
+                      Evaluations=[{
+                          "ComplianceResourceType": ci["resourceType"],
+                          "ComplianceResourceId":   ci["resourceId"],
+                          "ComplianceType":         "COMPLIANT" if compliant else "NON_COMPLIANT",
+                          "Annotation":             (note or "")[:256],
+                          "OrderingTimestamp":      _ordering_ts(ci),
+                      }],
+                      ResultToken=result_token
+                  )
+              except ClientError as e:
+                  logger.error(f"[put_evaluations] failed: {e}")
+                  raise
+
+
+          # ===================== Handler =====================
+
+          def lambda_handler(event, context):
+              """
+              Invoked by an Organization Config Rule in each member account.
+              Flow:
+                - Parse invokingEvent JSON.
+                - Ignore ScheduledNotification (no CI).
+                - Extract owning account/region from CI and evaluate tags.
+                - PutEvaluations from the SAME member account/region (assume role).
+                - If NON_COMPLIANT, fire-and-forget invoke of Tagger with context.
+              """
+              # Avoid logging resultToken; keep logs short
+              safe = dict(event or {})
+              safe.pop("resultToken", None)
+              try:
+                  logger.info(f"[evaluator] {json.dumps(safe)[:1800]}")
+              except Exception:
+                  logger.info("[evaluator] <event logged>")
+
+              invoking = json.loads(event.get("invokingEvent", "{}"))
+              message_type = invoking.get("messageType")
+              if message_type == "ScheduledNotification":
+                  return {"status": "ok", "reason": "scheduled-noop"}
+
+              token = event.get("resultToken")  # required by PutEvaluations
+              ci = invoking.get("configurationItem") or {}
+
+              status = ci.get("configurationItemStatus")
+              account_id = ci.get("awsAccountId") or event.get("awsAccountId")
+              region     = ci.get("awsRegion") or event.get("awsRegion") or context.invoked_function_arn.split(':')[3]
+              rtype      = ci.get("resourceType")
+              rid        = ci.get("resourceId")
+
+              # Silently skip if CI doesn't have core identifiers
+              if not (rtype and rid and account_id):
+                  if token:
+                      try:
+                          _put_eval(token, ci, True, "Missing identifiers in CI; skipping", account_id or MY_ACCOUNT_ID or "", region)
+                      except Exception:
+                          # If account_id is missing we can't safely put evaluation; ignore
+                          pass
+                  return {"status": "ok", "skipped": "missing-identifiers"}
+
+              # Delete/unrecorded states -> COMPLIANT (no action)
+              if status in ("ResourceDeleted", "ResourceNotRecorded", "ResourceDeletedNotRecorded"):
+                  if token:
+                      _put_eval(token, ci, True, f"Status {status}", account_id, region)
+                  return {"status": "ok", "skipped": status}
+
+              # Gather resource + baseline tags
+              res_tags = _extract_res_tags(ci) or {}
+              baseline = _account_tags(account_id)
+
+              if not baseline:
+                  # No org tags for this account -> treat as compliant
+                  if token:
+                      _put_eval(token, ci, True, "Account has no org tags (baseline empty)", account_id, region)
+                  return {"status": "ok", "baselineEmpty": True}
+
+              # Compare baseline vs resource
+              if ENFORCE_VALUES:
+                  missing = [k for k, v in baseline.items() if res_tags.get(k) != v]
+                  note = "Missing/wrong values: " + ", ".join(missing) if missing else "All tags present with correct values"
+              else:
+                  missing = [k for k in baseline.keys() if k not in res_tags]
+                  note = "Missing keys: " + ", ".join(missing) if missing else "All required keys present"
+
+              if missing:
+                  # 1) Report NON_COMPLIANT
+                  if token:
+                      _put_eval(token, ci, False, note, account_id, region)
+
+                  # 2) Kick the Tagger to remediate (async, keep evaluation fast)
+                  try:
+                      resource_arn = ci.get("arn") or ci.get("ARN") or ci.get("configurationItemArn")
+                      lambda_client.invoke(
+                          FunctionName=TAGGER_FN,
+                          InvocationType="Event",
+                          Payload=json.dumps({
+                              "accountId": account_id,
+                              "region": region,
+                              "resourceArn": resource_arn,
+                              "resourceType": rtype,
+                              "resourceId": rid,
+                              "missing": missing,
+                              "enforceValues": ENFORCE_VALUES,
+                              "baseline": baseline,
+                              "resourceTags": res_tags
+                          }).encode("utf-8")
+                      )
+                  except ClientError as e:
+                      logger.error(f"[evaluator] tagger invoke failed: {e}")
+
+                  return {"status": "noncompliant", "missing": missing}
+
+              # COMPLIANT
+              if token:
+                  _put_eval(token, ci, True, note, account_id, region)
+              return {"status": "compliant"}
+
+  # Permission for Config to invoke the evaluator (exact match to PrepareConfig.sh)
+  ConfigInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ConfigOrgAccountTagEvaluatorFunction
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+   
+  # Organization Config Rule (exact match to PrepareConfig.sh)
+  OrgAccountTagBaselineRule:
+    Type: AWS::Config::OrganizationConfigRule
+    Condition: HasOrganizationId
+    Properties:
+      OrganizationConfigRuleName: OrgAccountTagBaseline
+      OrganizationCustomRuleMetadata:
+        Description: "Ensure each resource has all tag KEYS present on its owning account's Organizations tags (keys-only baseline)."
+        LambdaFunctionArn: !GetAtt ConfigOrgAccountTagEvaluatorFunction.Arn
+        OrganizationConfigRuleTriggerTypes:
+          - ConfigurationItemChangeNotification
+          - OversizedConfigurationItemChangeNotification
+          - ScheduledNotification
+        MaximumExecutionFrequency: Six_Hours
+        ResourceTypesScope:
+          - AWS::EC2::Instance
+          - AWS::EC2::Volume
+          - AWS::EC2::NetworkInterface
+          - AWS::EC2::SecurityGroup
+          - AWS::EC2::VPC
+          - AWS::EC2::Subnet
+          - AWS::EC2::RouteTable
+          - AWS::EC2::InternetGateway
+          - AWS::EC2::NatGateway
+          - AWS::EC2::FlowLog
+          - AWS::ElasticLoadBalancingV2::LoadBalancer
+          - AWS::AutoScaling::AutoScalingGroup
+          - AWS::RDS::DBInstance
+          - AWS::RDS::DBCluster
+          - AWS::Lambda::Function
+          - AWS::S3::Bucket
+          - AWS::ECS::Cluster
+          - AWS::ECS::Service
+          - AWS::EKS::Cluster
+          - AWS::SNS::Topic
+          - AWS::SQS::Queue
+          - AWS::Logs::LogGroup
+
+  # ==================== OU TAG INHERITANCE COMPONENTS ====================
+  # Note: OU tag inheritance components are deployed separately in us-east-1 region
+  # Use the virginia-region-components.yaml template for deployment
+
+  # ==================== STACKSET COMPONENTS ====================
+  
+  # StackSet for TagPropagatorRole deployment
+  TagPropagatorStackSet:
+    Type: AWS::CloudFormation::StackSet
+    Condition: HasOrganizationId
+    Properties:
+      StackSetName: TagPropagatorRoleStackSet
+      Description: 'Deploy TagPropagatorRole to all member accounts for automated resource tagging'
+      TemplateBody: |
+        AWSTemplateFormatVersion: '2010-09-09'
+        Description: Cross-account role to allow the management account to tag resources in member accounts
+
+        Parameters:
+          ManagementAccountId:
+            Type: String
+            Description: 12-digit AWS Account ID of the management (payer) account
+            AllowedPattern: '^\d{12}$'
+            MinLength: 12
+            MaxLength: 12
+
+        Resources:
+          TagPropagatorRole:
+            Type: AWS::IAM::Role
+            Properties:
+              RoleName: TagPropagatorRole
+              AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      AWS: !Sub "arn:aws:iam::${ManagementAccountId}:root"
+                    Action: sts:AssumeRole
+              Policies:
+                - PolicyName: TagPropagationPermissions
+                  PolicyDocument:
+                    Version: '2012-10-17'
+                    Statement:
+                      - Effect: Allow
+                        Action:
+                          - tag:GetResources
+                          - tag:TagResources
+                          - tag:UntagResources
+                        Resource: "*"
+                      - Effect: Allow
+                        Action:
+                          - ec2:CreateTags
+                          - ec2:DeleteTags
+                        Resource: "*"
+                      - Effect: Allow
+                        Action:
+                          - s3:GetBucketTagging
+                          - s3:PutBucketTagging
+                          - s3:ListAllMyBuckets
+                        Resource: "*"
+                      - Effect: Allow
+                        Action:
+                          - rds:AddTagsToResource
+                          - rds:RemoveTagsFromResource
+                        Resource: "*"
+                      - Effect: Allow
+                        Action:
+                          - lambda:TagResource
+                          - lambda:UntagResource
+                        Resource: "*"
+                      - Effect: Allow
+                        Action:
+                          - logs:TagLogGroup
+                          - logs:UntagResource
+                          - logs:UntagLogGroup
+                        Resource: "*"
+                      - Effect: Allow
+                        Action:
+                          - kms:TagResource
+                          - kms:UntagResource
+                        Resource: "*"
+                      - Effect: Allow
+                        Action:
+                          - config:PutEvaluations
+                        Resource: "*"
+
+        Outputs:
+          RoleArn:
+            Description: ARN of the cross-account role
+            Value: !GetAtt TagPropagatorRole.Arn
+          RoleName:
+            Description: Name of the role
+            Value: !Ref TagPropagatorRole
+      
+      Parameters:
+        - ParameterKey: ManagementAccountId
+          ParameterValue: !Ref ManagementAccountId
+      
+      Capabilities:
+        - CAPABILITY_NAMED_IAM
+      
+      PermissionModel: SERVICE_MANAGED
+      AutoDeployment:
+        Enabled: true
+        RetainStacksOnAccountRemoval: false
+      
+      OperationPreferences:
+        FailureTolerancePercentage: !Ref FailureTolerancePercentage
+        MaxConcurrentPercentage: !Ref MaxConcurrentPercentage
+        RegionConcurrencyType: PARALLEL
+
+  # Custom Resource to automatically create StackSet instances
+  StackSetInstanceCreator:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: HasOrganizationId
+    DependsOn: TagPropagatorStackSet
+    Properties:
+      ServiceToken: !GetAtt StackSetInstanceCreatorFunction.Arn
+      StackSetName: !Ref TagPropagatorStackSet
+      DeploymentTargets: !Sub '{"OrganizationalUnitIds": ["${OrganizationId}"]}'
+      Regions: !Ref DeploymentRegions
+      OperationPreferences: !Sub '{"FailureTolerancePercentage": ${FailureTolerancePercentage}, "MaxConcurrentPercentage": ${MaxConcurrentPercentage}, "RegionConcurrencyType": "PARALLEL"}'
+
+  # Lambda function to create StackSet instances
+  StackSetInstanceCreatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-StackSetInstanceCreator'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt StackSetInstanceCreatorRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          from botocore.exceptions import ClientError
+
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  cloudformation = boto3.client('cloudformation')
+                  organizations = boto3.client('organizations')
+                  
+                  stack_set_name = event['ResourceProperties']['StackSetName']
+                  regions = event['ResourceProperties']['Regions']
+                  operation_preferences = json.loads(event['ResourceProperties']['OperationPreferences'])
+
+                  # Get the root OU ID from the organization
+                  try:
+                      roots = organizations.list_roots()
+                      root_ou_id = roots['Roots'][0]['Id']
+                      print(f"Root OU ID: {root_ou_id}")
+                      
+                      deployment_targets = {"OrganizationalUnitIds": [root_ou_id]}
+                      
+                  except Exception as e:
+                      print(f"Error getting root OU: {e}")
+                      # Fallback to empty array (deploy to all accounts)
+                      deployment_targets = {"OrganizationalUnitIds": []}
+
+                  print(f"Creating stack instances for StackSet: {stack_set_name}")
+                  print(f"Regions: {regions}")
+                  print(f"Deployment targets: {deployment_targets}")
+
+                  response = cloudformation.create_stack_instances(
+                      StackSetName=stack_set_name,
+                      DeploymentTargets=deployment_targets,
+                      Regions=regions,
+                      OperationPreferences=operation_preferences
+                  )
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'OperationId': response['OperationId']
+                  })
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # IAM role for StackSet instance creator
+  StackSetInstanceCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-StackSetInstanceCreatorRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StackSetInstanceCreatorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStackInstances
+                  - cloudformation:DescribeStackSet
+                  - cloudformation:DescribeStackSetOperation
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - organizations:ListRoots
+                  - organizations:ListAccounts
+                Resource: '*'
+
+Outputs:
+  # Management Account Components
+  TaggerFunctionArn:
+    Description: ARN of the OrgAccountTagger Lambda function
+    Value: !GetAtt OrgAccountTaggerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TaggerFunctionArn'
+  
+  EvaluatorFunctionArn:
+    Description: ARN of the ConfigOrgAccountTagEvaluator Lambda function
+    Value: !GetAtt ConfigOrgAccountTagEvaluatorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EvaluatorFunctionArn'
+  
+  LambdaTagPropagatorRoleArn:
+    Description: ARN of the LambdaTagPropagatorRole
+    Value: !GetAtt LambdaTagPropagatorRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaTagPropagatorRoleArn'
+  
+  OrganizationConfigRuleName:
+    Description: Name of the Organization Config Rule
+    Value: !Ref OrgAccountTagBaselineRule
+    Condition: HasOrganizationId
+  
+  # OU Tag Inheritance Components (deployed separately in us-east-1)
+  # See virginia-region-components.yaml for deployment
+  
+  # StackSet Components
+  TagPropagatorStackSetName:
+    Description: Name of the TagPropagator StackSet
+    Value: !Ref TagPropagatorStackSet
+    Condition: HasOrganizationId
+    Export:
+      Name: !Sub '${AWS::StackName}-TagPropagatorStackSetName'
+  
+  DeploymentRegions:
+    Description: Regions where the StackSet is deployed
+    Value: !Join [',', !Ref DeploymentRegions]
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentRegions'
