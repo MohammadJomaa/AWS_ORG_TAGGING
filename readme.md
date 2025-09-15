@@ -8,7 +8,7 @@ This solution provides automated resource tagging across your AWS Organization u
 2. **Virginia Region Template** (`virginia-region-components.yaml`) - OU tag inheritance components
 
 ## Architecture
-
+![Tagging Flow](./Tagging%20Flow.png)
 ### Main Components (Main Region)
 - **Lambda Functions**: Tag resources and evaluate compliance
 - **Organization Config Rule**: Monitors resource compliance
