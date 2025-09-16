@@ -56,7 +56,7 @@ Before deployment, gather:
 | `ManagementAccountId` | String | - | **Required** - Your AWS Organizations management account ID |
 | `OrganizationId` | String | - | **Required** - Your AWS Organizations ID (o-xxxxxxxxxx) |
 | `ConfigRegion` | String | - | **Required** - Region where Config service is enabled |
-| `EnforceValues` | Boolean | false | Whether to enforce tag values (not just keys) |
+| `EnforceValues` | Boolean | true | Whether to enforce tag values (not just keys) |
 | `TaggerFunctionName` | String | OrgAccountTagger | Name for the tagging Lambda function |
 | `EvaluatorFunctionName` | String | ConfigOrgAccountTagEvaluator | Name for the evaluator Lambda function |
 | `MemberRoleName` | String | TagPropagatorRole | Name for the cross-account role in member accounts |
