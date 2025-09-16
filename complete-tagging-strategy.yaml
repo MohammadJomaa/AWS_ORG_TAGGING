@@ -28,7 +28,7 @@ Parameters:
   EnforceValues:
     Type: String
     Description: Whether to enforce tag values (true) or just keys (false)
-    Default: 'false'
+    Default: 'true'
     AllowedValues:
       - 'true'
       - 'false'
