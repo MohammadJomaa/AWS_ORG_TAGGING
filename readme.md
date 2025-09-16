@@ -87,15 +87,20 @@ Automated resource tagging across AWS Organizations doesn't have to be complex. 
 The key to success is understanding your organization's specific requirements and adapting the solution accordingly. Start with the core functionality and gradually add more sophisticated features like OU tag inheritance and cross-region deployment.
 
 Remember that this is an ongoing process. Regular monitoring, testing, and updates are essential to maintaining an effective automated tagging strategy. The investment in setting up this system pays dividends in improved governance, compliance, and operational efficiency.
+---
 
-## Overview
+
+
+
+
+## Solution Overview
 
 This solution provides automated resource tagging across your AWS Organization using two CloudFormation templates:
 
 1. **Main Template** (`complete-tagging-strategy.yaml`) - Core tagging infrastructure
 2. **Virginia Region Template** (`virginia-region-components.yaml`) - OU tag inheritance components
 
-## Architecture
+## Solution Architecture
 ![Tagging Flow](./Tagging%20Flow.png)
 ### Main Components (Main Region)
 - **Lambda Functions**: Tag resources and evaluate compliance
